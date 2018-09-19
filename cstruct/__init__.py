@@ -106,6 +106,7 @@ __date__ = '15 August 2013'
 import re
 import struct
 import sys
+from collections import namedtuple
 
 __all__ = ['LITTLE_ENDIAN',
            'BIG_ENDIAN',
@@ -176,12 +177,15 @@ def typedef(type_, alias):
     """
     TYPEDEFS[alias] = type_
 
+FieldType = namedtuple('FieldType', [ 'vtype', 'vlen', 'flexible_array' ])
+
 class CStructMeta(type):
 
     def __new__(mcs, name, bases, dict):
         __struct__ = dict.get("__struct__", None)
         if __struct__ is not None:
             dict['__fmt__'], dict['__fields__'], dict['__fields_types__'] = mcs.parse_struct(__struct__)
+            print(dict['__fields_types__'])
             if '__byte_order__' in dict:
                 dict['__fmt__'] = dict['__byte_order__'] + dict['__fmt__']
             # Add the missing fields to the class
@@ -206,12 +210,16 @@ class CStructMeta(type):
         st = "  ".join(re.split("/\*.*\*/",st))
         st = "\n".join([s.split("//")[0] for s in st.split("\n")])
         st = st.replace("\n", " ")
+        flexible_array = False
         for line_s in st.split(";"):
             line_s = line_s.strip()
             if line_s:
                 line = line_s.split()
                 if len(line) < 2:
                     raise Exception("Error parsing: " + line_s)
+                # flexible array member must be the last member of such a struct
+                if flexible_array:
+                    raise Exception("Flexible array member must be the last member of such a struct")
                 vtype = line[0].strip()
                 # signed/unsigned/struct
                 if vtype == 'unsigned' or vtype == 'signed' or vtype == 'struct' and len(line) > 2:
@@ -236,14 +244,18 @@ class CStructMeta(type):
                     vname = t[0].strip()
                     vlen = t[1]
                     vlen = vlen.split("]")[0].strip()
-                    try:
-                        vlen = int(vlen)
-                    except:
-                        vlen = DEFINES.get(vlen, None)
-                        if vlen is None:
-                            raise
-                        else:
+                    if not vlen:
+                        flexible_array = True
+                        vlen = 0
+                    else:
+                        try:
                             vlen = int(vlen)
+                        except:
+                            vlen = DEFINES.get(vlen, None)
+                            if vlen is None:
+                                raise
+                            else:
+                                vlen = int(vlen)
                 while vtype in TYPEDEFS:
                     vtype = TYPEDEFS[vtype]
                 if vtype.startswith('struct '):
@@ -259,8 +271,8 @@ class CStructMeta(type):
                     if ttype is None:
                         raise Exception("Unknow type \"" + vtype + "\"")
                 fields.append(vname)
-                fields_types[vname] = (vtype, vlen)
-                if vlen > 1:
+                fields_types[vname] = FieldType(vtype, vlen, flexible_array)
+                if vlen > 1 or flexible_array:
                     fmt.append(str(vlen))
                 fmt.append(ttype)
         fmt = "".join(fmt)
@@ -278,9 +290,6 @@ class CStructMeta(type):
 # http://mikewatkins.ca/2008/11/29/python-2-and-3-metaclasses/#using-the-metaclass-in-python-2-x-and-3-x
 _CStructParent = CStructMeta('_CStructParent', (object, ), {})
 
-if sys.version_info < (2, 6):
-    EMPTY_BYTES_STRING = str()
-    CHAR_ZERO = '\0'
 if sys.version_info < (3, 0):
     EMPTY_BYTES_STRING = bytes()
     CHAR_ZERO = bytes('\0')
@@ -324,31 +333,31 @@ class CStruct(_CStructParent):
         data = struct.unpack(self.__fmt__, string)
         i = 0
         for field in self.__fields__:
-            (vtype, vlen) = self.__fields_types__[field]
-            if vtype == 'char': # string
+            field_type = self.__fields_types__[field]
+            if field_type.vtype == 'char': # string
                 setattr(self, field, data[i])
                 i = i + 1
-            elif isinstance(vtype, CStructMeta):
-                num = int(vlen / vtype.size)
+            elif isinstance(field_type.vtype, CStructMeta):
+                num = int(field_type.vlen / field_type.vtype.size)
                 if num == 1: # single struct
-                    sub_struct = vtype()
+                    sub_struct = field_type.vtype()
                     sub_struct.unpack(EMPTY_BYTES_STRING.join(data[i:i+sub_struct.size]))
                     setattr(self, field, sub_struct)
                     i = i + sub_struct.size
                 else: # multiple struct
                     sub_structs = []
                     for j in range(0, num):
-                        sub_struct = vtype()
+                        sub_struct = field_type.vtype()
                         sub_struct.unpack(EMPTY_BYTES_STRING.join(data[i:i+sub_struct.size]))
                         i = i + sub_struct.size
                         sub_structs.append(sub_struct)
                     setattr(self, field, sub_structs)
-            elif vlen == 1:
+            elif field_type.vlen == 1:
                 setattr(self, field, data[i])
-                i = i + vlen
+                i = i + field_type.vlen
             else:
-                setattr(self, field, list(data[i:i+vlen]))
-                i = i + vlen
+                setattr(self, field, list(data[i:i+field_type.vlen]))
+                i = i + field_type.vlen
 
     def pack(self):
         """
@@ -356,13 +365,13 @@ class CStruct(_CStructParent):
         """
         data = []
         for field in self.__fields__:
-            (vtype, vlen) = self.__fields_types__[field]
-            if vtype == 'char': # string
+            field_type = self.__fields_types__[field]
+            if field_type.vtype == 'char': # string
                 data.append(getattr(self, field))
-            elif isinstance(vtype, CStructMeta):
-                num = int(vlen / vtype.size)
+            elif isinstance(field_type.vtype, CStructMeta):
+                num = int(field_type.vlen / field_type.vtype.size)
                 if num == 1: # single struct
-                    v = getattr(self, field, vtype())
+                    v = getattr(self, field, field_type.vtype())
                     v = v.pack()
                     if sys.version_info >= (3, 0):
                         v = ([bytes([x]) for x in v])
@@ -373,17 +382,20 @@ class CStruct(_CStructParent):
                         try:
                             v = values[j]
                         except:
-                            v = vtype()
+                            v = field_type.vtype()
                         v = v.pack()
                         if sys.version_info >= (3, 0):
                             v = ([bytes([x]) for x in v])
                         data.extend(v)
-            elif vlen == 1:
+            elif field_type.vlen == 1:
                 data.append(getattr(self, field))
             else:
                 v = getattr(self, field)
-                v = v[:vlen] + [0] * (vlen - len(v))
+                v = v[:field_type.vlen] + [0] * (field_type.vlen - len(v))
+                # if field_type.flexible_array:
                 data.extend(v)
+        print(self.__fmt__)
+        print(data)
         return struct.pack(self.__fmt__, *data)
 
     def clear(self):

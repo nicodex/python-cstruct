@@ -62,3 +62,13 @@
 
 - add support for // comments
 
+### 1.8
+
+2018-08-17
+
+### Improved
+
+- add _t types (e.g. uint8_t)
+- examples fix
+- drop python 2.4, 2.5, 2.6 support
+- flexible arrays support
